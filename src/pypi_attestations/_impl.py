@@ -660,7 +660,105 @@ class GooglePublisher(_PublisherBase):
         return policy.Identity(identity=self.email, issuer="https://accounts.google.com")
 
 
-_Publisher = GitHubPublisher | GitLabPublisher | GooglePublisher
+class _CircleCITrustedPublisherPolicy:
+    """A custom sigstore-python policy for verifying against a CircleCI-based Trusted Publisher."""
+
+    def __init__(
+        self,
+        project_id: str,
+        pipeline_definition_id: str,
+        vcs_origin: str | None = None,
+        vcs_ref: str | None = None,
+    ) -> None:
+        self._project_id = project_id
+        self._pipeline_definition_id = pipeline_definition_id
+        self._vcs_origin = vcs_origin
+        self._vcs_ref = vcs_ref
+
+        # Build subpolicies: the issuer must be CircleCI.
+        subpolicies: list[policy.VerificationPolicy] = [
+            policy.OIDCIssuerV2("https://oidc.circleci.com")
+        ]
+
+        # If vcs_origin is specified, verify the source repository URI matches.
+        # CircleCI's source-repository-uri comes from oidc.circleci.com/vcs-origin
+        # and looks like "github.com/org/repo" (without https://).
+        if self._vcs_origin is not None:
+            subpolicies.append(policy.OIDCSourceRepositoryURI(self._vcs_origin))
+
+        # If vcs_ref is specified, verify the source repository ref matches.
+        # CircleCI's source-repository-ref comes from oidc.circleci.com/vcs-ref
+        # and looks like "refs/heads/main".
+        if self._vcs_ref is not None:
+            subpolicies.append(policy.OIDCSourceRepositoryRef(self._vcs_ref))
+
+        self._subpolicy = policy.AllOf(subpolicies)
+
+    def verify(self, cert: Certificate) -> None:
+        """Verify the certificate against the Trusted Publisher identity."""
+        self._subpolicy.verify(cert)
+
+        # Extract and verify the Build Signer URI.
+        # For CircleCI, the Build Signer URI looks like:
+        #     https://circleci.com/api/v2/projects/<project-id>/pipeline-definitions/<pipeline-definition-id>
+        build_signer_uri = cert.extensions.get_extension_for_oid(
+            policy._OIDC_BUILD_SIGNER_URI_OID  # noqa: SLF001
+        )
+        raw_build_signer_uri = _der_decode_utf8string(build_signer_uri.value.public_bytes())
+
+        expected_build_signer_uri = (
+            f"https://circleci.com/api/v2/projects/{self._project_id}/"
+            f"pipeline-definitions/{self._pipeline_definition_id}"
+        )
+        if raw_build_signer_uri != expected_build_signer_uri:
+            raise sigstore.errors.VerificationError(
+                f"Certificate's Build Signer URI ({raw_build_signer_uri}) does not match expected "
+                f"Trusted Publisher ({expected_build_signer_uri})"
+            )
+
+
+class CircleCIPublisher(_PublisherBase):
+    """A CircleCI-based Trusted Publisher."""
+
+    kind: Literal["CircleCI"] = "CircleCI"
+
+    project_id: str
+    """
+    The CircleCI project ID (UUID) that performed the publishing action.
+    """
+
+    pipeline_definition_id: str
+    """
+    The CircleCI pipeline definition ID (UUID) that defines the pipeline configuration.
+    This uniquely identifies the specific pipeline definition allowed to publish.
+    """
+
+    vcs_origin: str | None = None
+    """
+    The optional source repository URI that triggered the pipeline.
+    This comes from the oidc.circleci.com/vcs-origin claim and looks like
+    "github.com/org/repo" (without the https:// prefix).
+    Not present for pipelines triggered by custom webhooks.
+    """
+
+    vcs_ref: str | None = None
+    """
+    The optional git ref that triggered the pipeline.
+    This comes from the oidc.circleci.com/vcs-ref claim and looks like
+    "refs/heads/main" or "refs/tags/v1.0.0".
+    Not present for pipelines triggered by custom webhooks.
+    """
+
+    def _as_policy(self) -> VerificationPolicy:
+        return _CircleCITrustedPublisherPolicy(
+            self.project_id,
+            self.pipeline_definition_id,
+            self.vcs_origin,
+            self.vcs_ref,
+        )
+
+
+_Publisher = GitHubPublisher | GitLabPublisher | GooglePublisher | CircleCIPublisher
 Publisher = Annotated[_Publisher, Field(discriminator="kind")]
 
 

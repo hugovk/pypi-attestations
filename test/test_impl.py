@@ -677,12 +677,45 @@ class TestPublisher:
         assert gl.environment == "publish"
         assert TypeAdapter(impl.Publisher).validate_json(json.dumps(gl_raw)) == gl
 
+        cci_raw = {
+            "kind": "CircleCI",
+            "project_id": "abcdef01-2345-6789-abcd-ef0123456789",
+            "pipeline_definition_id": "fedcba98-7654-3210-fedc-ba9876543210",
+        }
+        cci: impl.Publisher = TypeAdapter(impl.Publisher).validate_python(cci_raw)
+        assert isinstance(cci, impl.CircleCIPublisher)
+        assert cci.project_id == "abcdef01-2345-6789-abcd-ef0123456789"
+        assert cci.pipeline_definition_id == "fedcba98-7654-3210-fedc-ba9876543210"
+        assert cci.vcs_origin is None
+        assert cci.vcs_ref is None
+        assert TypeAdapter(impl.Publisher).validate_json(json.dumps(cci_raw)) == cci
+
+        cci_full_raw = {
+            "kind": "CircleCI",
+            "project_id": "abcdef01-2345-6789-abcd-ef0123456789",
+            "pipeline_definition_id": "fedcba98-7654-3210-fedc-ba9876543210",
+            "vcs_origin": "github.com/myorg/myrepo",
+            "vcs_ref": "refs/heads/main",
+        }
+        cci_full: impl.Publisher = TypeAdapter(impl.Publisher).validate_python(cci_full_raw)
+        assert isinstance(cci_full, impl.CircleCIPublisher)
+        assert cci_full.vcs_origin == "github.com/myorg/myrepo"
+        assert cci_full.vcs_ref == "refs/heads/main"
+        assert TypeAdapter(impl.Publisher).validate_json(json.dumps(cci_full_raw)) == cci_full
+
     def test_wrong_kind(self) -> None:
         with pytest.raises(ValueError, match="Input should be 'GitHub'"):
             impl.GitHubPublisher(kind="wrong", repository="foo/bar", workflow="publish.yml")
 
         with pytest.raises(ValueError, match="Input should be 'GitLab'"):
             impl.GitLabPublisher(kind="GitHub", repository="foo/bar")
+
+        with pytest.raises(ValueError, match="Input should be 'CircleCI'"):
+            impl.CircleCIPublisher(
+                kind="GitHub",
+                project_id="abcdef01-2345-6789-abcd-ef0123456789",
+                pipeline_definition_id="fedcba98-7654-3210-fedc-ba9876543210",
+            )
 
 
 class TestProvenance:
@@ -787,3 +820,79 @@ class TestGooglePublisher:
             email="919436158236-compute@developer.gserviceaccount.com",
         )
         publisher._as_policy().verify(cert)
+
+
+class TestCircleCIPublisher:
+    def test_verifies(self) -> None:
+        cert_path = _ASSETS / "circleci-oidc.pem"
+        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+
+        publisher = impl.CircleCIPublisher(
+            project_id="fdd9283f-e619-46af-8f9c-851f7d3e8b2b",
+            pipeline_definition_id="8e4f8ab2-8d7c-4827-9f15-de076d6d647f",
+            vcs_origin="github.com/CircleCI-Public/sign-and-publish-examples",
+            vcs_ref="refs/heads/pypi",
+        )
+        publisher._as_policy().verify(cert)
+
+    def test_verifies_without_optional_claims(self) -> None:
+        cert_path = _ASSETS / "circleci-oidc.pem"
+        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+
+        publisher = impl.CircleCIPublisher(
+            project_id="fdd9283f-e619-46af-8f9c-851f7d3e8b2b",
+            pipeline_definition_id="8e4f8ab2-8d7c-4827-9f15-de076d6d647f",
+        )
+        publisher._as_policy().verify(cert)
+
+    def test_fails_wrong_build_signer_uri(self) -> None:
+        cert_path = _ASSETS / "circleci-oidc.pem"
+        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+
+        publisher = impl.CircleCIPublisher(
+            project_id="fdd9283f-e619-46af-8f9c-851f7d3e8b2b",
+            pipeline_definition_id="wrong-pipeline-id",
+        )
+        with pytest.raises(
+            sigstore.errors.VerificationError,
+            match="Certificate's Build Signer URI .* does not match expected Trusted Publisher",
+        ):
+            publisher._as_policy().verify(cert)
+
+    def test_fails_wrong_issuer(self) -> None:
+        cert_path = _ASSETS / "circleci-oidc.pem"
+        orig_cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+
+        from pyasn1.codec.der.encoder import encode as der_encode
+        from pyasn1.type.char import UTF8String
+
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(orig_cert.subject)
+            .issuer_name(orig_cert.issuer)
+            .public_key(orig_cert.public_key())
+            .serial_number(orig_cert.serial_number)
+            .not_valid_before(orig_cert.not_valid_before_utc)
+            .not_valid_after(orig_cert.not_valid_after_utc)
+        )
+
+        for ext in orig_cert.extensions:
+            if ext.oid == policy._OIDC_ISSUER_V2_OID:
+                builder = builder.add_extension(
+                    x509.UnrecognizedExtension(
+                        policy._OIDC_ISSUER_V2_OID,
+                        der_encode(UTF8String("https://wrong-issuer.example.com")),
+                    ),
+                    critical=False,
+                )
+            else:
+                builder = builder.add_extension(ext.value, ext.critical)
+
+        cert = builder.sign(ec.generate_private_key(ec.SECP256R1()), hashes.SHA256())
+
+        publisher = impl.CircleCIPublisher(
+            project_id="fdd9283f-e619-46af-8f9c-851f7d3e8b2b",
+            pipeline_definition_id="8e4f8ab2-8d7c-4827-9f15-de076d6d647f",
+        )
+        with pytest.raises(sigstore.errors.VerificationError):
+            publisher._as_policy().verify(cert)

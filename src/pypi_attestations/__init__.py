@@ -1,12 +1,13 @@
 """The `pypi-attestations` APIs."""
 
-__version__ = "0.0.29"
+__version__ = "0.0.30"
 
 from ._impl import (
     Attestation,
     AttestationBundle,
     AttestationError,
     AttestationType,
+    CircleCIPublisher,
     ConversionError,
     Distribution,
     Envelope,
@@ -25,6 +26,7 @@ __all__ = [
     "AttestationBundle",
     "AttestationError",
     "AttestationType",
+    "CircleCIPublisher",
     "ConversionError",
     "Distribution",
     "Envelope",
